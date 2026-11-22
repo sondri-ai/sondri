@@ -1,8 +1,11 @@
 import { AuditLang, Env } from '../types';
+import { hasValidApiKey } from '../lib/auth';
 import {
   checkAndIncrementAiUsage,
+  consumeDailyQuota,
   getAuditById,
   getCachedAuditByDomain,
+  parseDailyCap,
   recordLead,
   saveAuditStep1,
   StoredAudit,
@@ -15,7 +18,7 @@ import {
   inferContextAndBuyerQuestions,
   runGeminiGroundedVisibility,
 } from '../lib/gemini';
-import { sendDiscordNotification } from '../lib/discord';
+import { escapeDiscordText, sanitizeDiscordCode, sendDiscordNotification } from '../lib/discord';
 import { appendToGoogleSheet } from '../lib/sheets';
 
 const DISPOSABLE_DOMAINS = new Set([
@@ -67,14 +70,32 @@ async function verifyTurnstile(token: string | undefined, secret: string, ip: st
   }
 }
 
+function resolveClientIdentity(request: Request): { clientIp: string; isLocalDev: boolean } {
+  const reqHost = new URL(request.url).hostname.toLowerCase();
+  const isLocalHost = reqHost === 'localhost' || reqHost === '127.0.0.1';
+  const cfIp = request.headers.get('CF-Connecting-IP')?.trim() || '';
+  if (isLocalHost) {
+    const isLocalLoopback = !cfIp || cfIp === '127.0.0.1' || cfIp === '::1';
+    return { clientIp: cfIp || '127.0.0.1', isLocalDev: isLocalLoopback };
+  }
+  return { clientIp: cfIp || 'unknown', isLocalDev: false };
+}
+
+function toPublicAuditResponse(audit: StoredAudit): StoredAudit {
+  return {
+    ...audit,
+    full_audit: null,
+  };
+}
+
 export async function handleAuditScan(request: Request, env: Env): Promise<Response> {
   try {
     const body: any = await request.json();
     const rawUrl = String(body.url || '').trim();
     const lang: AuditLang = body.lang === 'es' ? 'es' : 'en';
-    const userCity = String(body.city || '').trim();
-    const userService = String(body.service || '').trim();
-    const forceRefresh = Boolean(body.force);
+    const userCity = String(body.city || '').trim().slice(0, 120);
+    const userService = String(body.service || '').trim().slice(0, 120);
+    const forceRefresh = Boolean(body.force) && (await hasValidApiKey(request, env));
 
     let normalized;
     try {
@@ -86,15 +107,53 @@ export async function handleAuditScan(request: Request, env: Env): Promise<Respo
       );
     }
 
-    // Check 7-day domain cache if user didn't pass custom overrides or force refresh
+    // Check 7-day domain cache if user didn't pass custom overrides or authorized force refresh
     if (!forceRefresh && !userCity && !userService) {
       const cached = await getCachedAuditByDomain(env, normalized.domain, lang);
       if (cached && cached.tech_scan) {
+        const now = new Date();
+        const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        const callerRecord: StoredAudit = {
+          id: `aud_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+          domain: cached.domain,
+          url: cached.url,
+          lang: cached.lang,
+          city: cached.city,
+          service: cached.service,
+          tech_scan: { ...cached.tech_scan },
+          lighthouse: cached.lighthouse,
+          questions: [...(cached.questions || [])],
+          ai_visibility: null,
+          full_audit: null,
+          created_at: now.toISOString(),
+          expires_at: expires.toISOString(),
+        };
+        await saveAuditStep1(env, callerRecord);
         return Response.json({
           success: true,
-          data: { ...cached, cached: true },
+          data: { ...toPublicAuditResponse(callerRecord), cached: true },
         });
       }
+    }
+
+    const { clientIp, isLocalDev } = resolveClientIdentity(request);
+    const ipHash = await hashIp(clientIp);
+    const dailyAuditCap = parseDailyCap(env.DAILY_AUDIT_CAP, 50);
+    const scanDailyCap = dailyAuditCap === 0 ? 0 : dailyAuditCap * 3;
+    const scanQuota = await consumeDailyQuota(env, {
+      globalScope: 'global_scan_runs',
+      ipScope: `scan_ip:${ipHash}`,
+      maxPerIpPerDay: isLocalDev ? 1000 : 20,
+      globalDailyCap: scanDailyCap,
+    });
+    if (!scanQuota.allowed) {
+      return Response.json(
+        {
+          success: false,
+          error: { code: 'RATE_LIMITED', message: 'Daily scan limit reached. Please try again tomorrow.' },
+        },
+        { status: 429 }
+      );
     }
 
     const techScan = await runTechnicalScan(normalized.url, lang, userCity, userService);
@@ -109,6 +168,9 @@ export async function handleAuditScan(request: Request, env: Env): Promise<Respo
 
     techScan.inferredCity = inferred.city;
     techScan.inferredService = inferred.service;
+    if (userCity || userService) {
+      techScan.customInput = true;
+    }
 
     const now = new Date();
     const expires = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
@@ -133,7 +195,7 @@ export async function handleAuditScan(request: Request, env: Env): Promise<Respo
 
     return Response.json({
       success: true,
-      data: { ...record, cached: false },
+      data: { ...toPublicAuditResponse(record), cached: false },
     });
   } catch (err: any) {
     return Response.json(
@@ -155,24 +217,70 @@ export async function handleAuditLighthouse(request: Request, env: Env): Promise
     const auditId = urlObj.searchParams.get('audit_id') || '';
     const rawUrl = urlObj.searchParams.get('url') || '';
 
+    const checkLighthouseQuota = async (): Promise<Response | null> => {
+      const { clientIp, isLocalDev } = resolveClientIdentity(request);
+      const ipHash = await hashIp(clientIp);
+      const dailyAuditCap = parseDailyCap(env.DAILY_AUDIT_CAP, 50);
+      const lhDailyCap = dailyAuditCap === 0 ? 0 : dailyAuditCap * 3;
+      const quota = await consumeDailyQuota(env, {
+        globalScope: 'global_lighthouse_runs',
+        ipScope: `lh_ip:${ipHash}`,
+        maxPerIpPerDay: isLocalDev ? 1000 : 20,
+        globalDailyCap: lhDailyCap,
+      });
+      if (!quota.allowed) {
+        return Response.json(
+          {
+            success: false,
+            error: { code: 'RATE_LIMITED', message: 'Daily PageSpeed check limit reached.' },
+          },
+          { status: 429 }
+        );
+      }
+      return null;
+    };
+
     if (auditId) {
       const existing = await getAuditById(env, auditId);
       if (existing?.lighthouse && existing.lighthouse.performanceScore !== null) {
         return Response.json({ success: true, data: existing.lighthouse });
       }
-      const targetUrl = existing?.url || rawUrl;
-      if (!targetUrl) {
+      const rawTargetUrl = existing?.url || rawUrl;
+      if (!rawTargetUrl) {
         return Response.json(
           { success: false, error: { code: 'MISSING_URL', message: 'Missing target URL' } },
           { status: 400 }
         );
       }
-      const lh = await fetchLighthouseResult(targetUrl, env.PAGESPEED_API_KEY);
+      let normalized;
+      try {
+        normalized = normalizeInputUrl(rawTargetUrl);
+      } catch (e: any) {
+        return Response.json(
+          { success: false, error: { code: 'INVALID_URL', message: e.message } },
+          { status: 400 }
+        );
+      }
+      const quotaErr = await checkLighthouseQuota();
+      if (quotaErr) return quotaErr;
+
+      const lh = await fetchLighthouseResult(normalized.url, env.PAGESPEED_API_KEY);
       await updateAuditLighthouse(env, auditId, lh);
       return Response.json({ success: true, data: lh });
     }
 
-    const normalized = normalizeInputUrl(rawUrl);
+    let normalized;
+    try {
+      normalized = normalizeInputUrl(rawUrl);
+    } catch (e: any) {
+      return Response.json(
+        { success: false, error: { code: 'INVALID_URL', message: e.message } },
+        { status: 400 }
+      );
+    }
+    const quotaErr = await checkLighthouseQuota();
+    if (quotaErr) return quotaErr;
+
     const lh = await fetchLighthouseResult(normalized.url, env.PAGESPEED_API_KEY);
     return Response.json({ success: true, data: lh });
   } catch (err: any) {
@@ -197,13 +305,13 @@ export async function handleAuditAiVisibility(
     const name = String(body.name || '').trim();
     const email = String(body.email || '').trim().toLowerCase();
     const phone = String(body.phone || '').trim();
-    const customCity = String(body.city || '').trim();
-    const customService = String(body.service || '').trim();
+    const customCity = String(body.city || '').trim().slice(0, 120);
+    const customService = String(body.service || '').trim().slice(0, 120);
     const customQuestions: string[] = Array.isArray(body.questions)
       ? body.questions
-          .map((q: any) => String(q || '').trim())
+          .map((q: any) => String(q || '').trim().slice(0, 240))
           .filter(Boolean)
-          .slice(0, 5)
+          .slice(0, 3)
       : [];
 
     if (!auditId) {
@@ -226,10 +334,7 @@ export async function handleAuditAiVisibility(
       );
     }
 
-    const clientIp =
-      request.headers.get('CF-Connecting-IP') ||
-      request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
-      '0.0.0.0';
+    const { clientIp, isLocalDev } = resolveClientIdentity(request);
 
     if (env.TURNSTILE_SECRET_KEY) {
       const ok = await verifyTurnstile(body.turnstile_token, env.TURNSTILE_SECRET_KEY, clientIp);
@@ -260,21 +365,12 @@ export async function handleAuditAiVisibility(
     const finalService = customService || audit.service;
     const finalQuestions =
       customQuestions.length > 0 ? customQuestions : audit.questions.slice(0, 3);
-
-    // 1. Always capture the lead in D1
-    const leadId = `lead_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`;
-    await recordLead(env, {
-      id: leadId,
-      name,
-      email,
-      phone,
-      domain: audit.domain,
-      city: finalCity,
-      service: finalService,
-      lang: audit.lang,
-      auditId: audit.id,
-      ipHash,
-    });
+    const isCustomized =
+      Boolean(audit.tech_scan.customInput) ||
+      (Boolean(customCity) && customCity !== audit.city) ||
+      (Boolean(customService) && customService !== audit.service) ||
+      (customQuestions.length > 0 &&
+        JSON.stringify(customQuestions) !== JSON.stringify(audit.questions));
 
     const computeCombinedAiScore = (baseTechScore: number, vis: any): number => {
       // Base technical readiness is capped at 45 pts; live AI visibility contributes up to 55 pts
@@ -290,7 +386,7 @@ export async function handleAuditAiVisibility(
       const mentionsStr = vis ? `${vis.namedCount}/${vis.totalQuestions}` : 'Pending';
       const compsStr =
         vis && Array.isArray(vis.competitorsSummary) && vis.competitorsSummary.length > 0
-          ? vis.competitorsSummary.slice(0, 5).join(', ')
+          ? escapeDiscordText(vis.competitorsSummary.slice(0, 5).join(', '), 300)
           : 'None';
 
       ctx.waitUntil(
@@ -298,7 +394,7 @@ export async function handleAuditAiVisibility(
           sendDiscordNotification(
             env,
             '🔍 New AEO Mini Audit Lead!',
-            `**Name:** ${name || 'N/A'}\n**Email:** ${email}\n**Phone:** ${phone || 'N/A'}\n**Domain:** \`${audit.domain}\`\n**Service / Market:** ${finalService} (${finalCity})\n**Combined AI Score:** ${combinedScore}/100 (AI Mentions: ${mentionsStr})\n**Competitors Named:** ${compsStr}\n**Language:** ${audit.lang.toUpperCase()}`,
+            `**Name:** ${escapeDiscordText(name || 'N/A', 120)}\n**Email:** ${escapeDiscordText(email, 200)}\n**Phone:** ${escapeDiscordText(phone || 'N/A', 60)}\n**Domain:** \`${sanitizeDiscordCode(audit.domain, 120)}\`\n**Service / Market:** ${escapeDiscordText(finalService, 140)} (${escapeDiscordText(finalCity, 120)})\n**Combined AI Score:** ${combinedScore}/100 (AI Mentions: ${escapeDiscordText(mentionsStr, 30)})\n**Competitors Named:** ${compsStr}\n**Language:** ${audit.lang.toUpperCase()}`,
             0x3b82f6,
             env.DISCORD_AEO_WEBHOOK_URL || env.DISCORD_WEBHOOK_URL,
             'Sondri AEO Audit Bot'
@@ -319,7 +415,23 @@ export async function handleAuditAiVisibility(
       );
     };
 
-    // 2. If this audit already has valid AI visibility results and questions match, return cached ($0)
+    const captureLead = async () => {
+      const leadId = `lead_${crypto.randomUUID().replace(/-/g, '').slice(0, 14)}`;
+      await recordLead(env, {
+        id: leadId,
+        name,
+        email,
+        phone,
+        domain: audit.domain,
+        city: finalCity,
+        service: finalService,
+        lang: audit.lang,
+        auditId: audit.id,
+        ipHash,
+      });
+    };
+
+    // 1. If this audit already has valid AI visibility results and questions match, return cached ($0)
     const questionsUnchanged =
       JSON.stringify(finalQuestions) === JSON.stringify(audit.questions);
     const hasValidAiRuns =
@@ -329,6 +441,22 @@ export async function handleAuditAiVisibility(
       audit.ai_visibility.runs.length > 0 &&
       audit.ai_visibility.runs.every((r) => r.status === 'ok');
     if (hasValidAiRuns && questionsUnchanged) {
+      const leadQuota = await consumeDailyQuota(env, {
+        globalScope: 'global_lead_writes',
+        ipScope: `lead_ip:${ipHash}`,
+        maxPerIpPerDay: isLocalDev ? 1000 : 15,
+        globalDailyCap: 1000,
+      });
+      if (!leadQuota.allowed) {
+        return Response.json(
+          {
+            success: false,
+            error: { code: 'RATE_LIMITED', message: 'Daily audit submission limit reached.' },
+          },
+          { status: 429 }
+        );
+      }
+      await captureLead();
       audit.tech_scan.readinessScore = computeCombinedAiScore(
         audit.tech_scan.readinessScore,
         audit.ai_visibility
@@ -336,17 +464,37 @@ export async function handleAuditAiVisibility(
       fireLeadNotifications(audit.ai_visibility);
       return Response.json({
         success: true,
-        data: { ...audit, cached: true },
+        data: { ...toPublicAuditResponse(audit), cached: true },
       });
     }
 
-    // 3. Check domain-level cache in D1 for identical questions ($0)
-    const domainCached = await getCachedAuditByDomain(env, audit.domain, audit.lang);
+    // 2. Check domain-level cache in D1 for identical default-market prompt sets ($0)
+    const domainCached = !isCustomized
+      ? await getCachedAuditByDomain(env, audit.domain, audit.lang)
+      : null;
     if (
       domainCached &&
       domainCached.ai_visibility &&
+      domainCached.service === finalService &&
+      domainCached.city === finalCity &&
       JSON.stringify(domainCached.questions) === JSON.stringify(finalQuestions)
     ) {
+      const leadQuota = await consumeDailyQuota(env, {
+        globalScope: 'global_lead_writes',
+        ipScope: `lead_ip:${ipHash}`,
+        maxPerIpPerDay: isLocalDev ? 1000 : 15,
+        globalDailyCap: 1000,
+      });
+      if (!leadQuota.allowed) {
+        return Response.json(
+          {
+            success: false,
+            error: { code: 'RATE_LIMITED', message: 'Daily audit submission limit reached.' },
+          },
+          { status: 429 }
+        );
+      }
+      await captureLead();
       await updateAuditAiVisibility(
         env,
         audit.id,
@@ -364,15 +512,40 @@ export async function handleAuditAiVisibility(
       fireLeadNotifications(audit.ai_visibility);
       return Response.json({
         success: true,
-        data: { ...audit, cached: true },
+        data: { ...toPublicAuditResponse(audit), cached: true },
       });
     }
 
-    // 4. Enforce per-IP rate limit and daily circuit breaker before calling paid AI APIs
-    // Allow generous per-IP testing (50/day) and bypass per-IP cap on localhost dev
-    const isLocalDev = clientIp === '0.0.0.0' || clientIp === '127.0.0.1' || clientIp === '::1';
+    // 3. Enforce per-IP rate limit and daily circuit breaker BEFORE writing D1 leads or firing webhooks
     const usageCheck = await checkAndIncrementAiUsage(env, ipHash, isLocalDev ? 1000 : 30);
     if (!usageCheck.allowed) {
+      if (usageCheck.reason === 'ip_rate_limit') {
+        return Response.json(
+          {
+            success: false,
+            error: { code: 'RATE_LIMITED', message: 'Daily audit rate limit reached.' },
+          },
+          { status: 429 }
+        );
+      }
+
+      const queuedQuota = await consumeDailyQuota(env, {
+        globalScope: 'global_queued_leads',
+        ipScope: `queued_lead_ip:${ipHash}`,
+        maxPerIpPerDay: isLocalDev ? 1000 : 3,
+        globalDailyCap: 500,
+      });
+      if (!queuedQuota.allowed) {
+        return Response.json(
+          {
+            success: false,
+            error: { code: 'RATE_LIMITED', message: 'Daily queued submission limit reached.' },
+          },
+          { status: 429 }
+        );
+      }
+
+      await captureLead();
       const fallbackVisibility = {
         ranAt: new Date().toISOString(),
         engine: 'gemini' as const,
@@ -406,7 +579,7 @@ export async function handleAuditAiVisibility(
       return Response.json({
         success: true,
         data: {
-          ...audit,
+          ...toPublicAuditResponse(audit),
           city: finalCity,
           service: finalService,
           questions: finalQuestions,
@@ -416,13 +589,17 @@ export async function handleAuditAiVisibility(
       });
     }
 
-    // 5. Run live Gemini grounded visibility check
+    // 4. Record lead and run live Gemini grounded visibility check
+    await captureLead();
     const aiVisibility = await runGeminiGroundedVisibility(
       finalQuestions,
       audit.tech_scan,
       audit.lang,
       env.GEMINI_API_KEY
     );
+    if (isCustomized) {
+      aiVisibility.customInput = true;
+    }
 
     audit.tech_scan.readinessScore = computeCombinedAiScore(
       audit.tech_scan.readinessScore,
@@ -437,13 +614,6 @@ export async function handleAuditAiVisibility(
       finalCity,
       finalService
     );
-    await saveAuditStep1(env, {
-      ...audit,
-      city: finalCity,
-      service: finalService,
-      questions: finalQuestions,
-      ai_visibility: aiVisibility,
-    });
 
     audit.questions = finalQuestions;
     audit.city = finalCity;
@@ -454,7 +624,7 @@ export async function handleAuditAiVisibility(
 
     return Response.json({
       success: true,
-      data: { ...audit, cached: false },
+      data: { ...toPublicAuditResponse(audit), cached: false },
     });
   } catch (err: any) {
     return Response.json(
@@ -476,13 +646,13 @@ export async function handleGetAudit(
   auditId: string
 ): Promise<Response> {
   const audit = await getAuditById(env, auditId);
-  if (!audit) {
+  if (!audit || audit.expires_at <= new Date().toISOString()) {
     return Response.json(
       { success: false, error: { code: 'NOT_FOUND', message: 'Audit not found' } },
       { status: 404 }
     );
   }
-  return Response.json({ success: true, data: audit });
+  return Response.json({ success: true, data: toPublicAuditResponse(audit) });
 }
 
 export async function runBackgroundFullAuditBaseline(
@@ -515,7 +685,7 @@ export async function runBackgroundFullAuditBaseline(
     await sendDiscordNotification(
       env,
       '📊 $99 Full Audit — 12-Question Gemini Baseline Ready',
-      `**Domain:** \`${audit.domain}\`\n**Client:** ${customerEmail}\n**Audit ID:** \`${audit.id}\`\n**Gemini Grounded Mentions:** ${fullBaseline.namedCount}/${fullBaseline.totalQuestions}\n**Domain Citations:** ${fullBaseline.citedCount}/${fullBaseline.totalQuestions}\n**Competitors Found:** ${fullBaseline.competitorsSummary.join(', ') || 'None'}\n**Top Cited Sources:** ${fullBaseline.topSourceDomains.join(', ') || 'None'}`,
+      `**Domain:** \`${sanitizeDiscordCode(audit.domain, 120)}\`\n**Client:** ${escapeDiscordText(customerEmail, 200)}\n**Audit ID:** \`${sanitizeDiscordCode(audit.id, 64)}\`\n**Gemini Grounded Mentions:** ${fullBaseline.namedCount}/${fullBaseline.totalQuestions}\n**Domain Citations:** ${fullBaseline.citedCount}/${fullBaseline.totalQuestions}\n**Competitors Found:** ${escapeDiscordText(fullBaseline.competitorsSummary.join(', ') || 'None', 300)}\n**Top Cited Sources:** ${escapeDiscordText(fullBaseline.topSourceDomains.join(', ') || 'None', 300)}`,
       0x10b981
     );
   } catch (err) {
